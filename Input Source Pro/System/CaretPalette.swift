@@ -16,6 +16,10 @@ final class CaretPalette {
 
     private let sourceID = "com.runjuu.Input-Source-Pro.inputmethod.PaletteControl"
     private var sample: Sample?
+    /// When the focused pane changed after `sample` was taken: the helper resamples within
+    /// `staleGrace`, so until then a stale sample is waited on rather than shown.
+    private var staleSince: TimeInterval?
+    static let staleGrace: TimeInterval = 0.1
     private var pendingConfirmation: Confirmation?
     private var focus = FocusReadiness()
     private var focusID: String?
@@ -93,6 +97,22 @@ final class CaretPalette {
         mutating func resolve(_ state: TextFocus, pid: pid_t?, at uptime: TimeInterval) {
             self.state = state
             confirmation = state.permitsCaret ? pid.map { Confirmation(pid: $0, uptime: uptime) } : nil
+        }
+
+        /// Handles a helper report without a caret; returns whether it is current.
+        /// The report's session is not checked: an app getting focus back, for example after a floating
+        /// panel such as Raycast closes, starts a new helper session whose first report is this one.
+        mutating func receiveMissingCaret(
+            at uptime: TimeInterval,
+            after lastUptime: TimeInterval,
+            isTemporaryInputWindowInProgress: Bool,
+            pid: pid_t?
+        ) -> Bool {
+            guard uptime >= lastUptime, !isTemporaryInputWindowInProgress else { return false }
+            // Wait for the helper's next sample rather than falling back to the mouse. Custom editors
+            // such as Zed expose no text field to Accessibility, so `unknown` focus waits too.
+            if state.permitsCaret, let pid { confirmation = Confirmation(pid: pid, uptime: uptime) }
+            return true
         }
 
         func isAwaitingConfirmation(for pid: pid_t, now: TimeInterval, focusedAt: TimeInterval) -> Bool {
@@ -373,13 +393,15 @@ final class CaretPalette {
         }
         if rectString.isEmpty && !pending {
             // The temporary input window's focus steal makes the helper report focus loss;
-            // the sample stays valid for the app that gets focus back.
-            if self.session == session, uptime >= lastUptime, !InputSourceSwitcher.isTemporaryInputWindowInProgress {
-                sample = nil
+            // the sample stays valid for the app that gets focus back. A floating panel such as Raycast
+            // taking key focus also leaves the caret where it was, so the sample is kept and serves the app
+            // while fresh; a field change within the app clears it through the focus update.
+            if focus.receiveMissingCaret(
+                at: uptime, after: lastUptime,
+                isTemporaryInputWindowInProgress: InputSourceSwitcher.isTemporaryInputWindowInProgress,
+                pid: focusApplication?.processIdentifier
+            ) {
                 pendingConfirmation = nil
-                if textFocus == .input, let app = focusApplication {
-                    focus.confirmation = Confirmation(pid: app.processIdentifier, uptime: uptime)
-                }
             }
         } else if textFocus.permitsCaret, let owner = pid_t(exactly: pid),
                   // The temporary input window may hold focus while the helper reports the app it took it from.
@@ -392,6 +414,7 @@ final class CaretPalette {
             } else {
                 pendingConfirmation = nil
                 sample = Sample(rect: NSRectFromString(rectString), pid: owner, uptime: uptime)
+                staleSince = nil
                 if sample?.point(for: owner, now: uptime, focusedAt: focusedAt,
                                  screens: NSScreen.screens.map(\.frame)) != nil {
                     focus.confirmation = nil
@@ -419,12 +442,31 @@ final class CaretPalette {
             return nil
         }
         let now = ProcessInfo.processInfo.systemUptime
+        if isWaitingOnStaleSample(for: app.processIdentifier, now: now) {
+            IndicatorDiagnostics.record("helper.lookup pid=\(app.processIdentifier) point=nil reason=stale-pane-sample")
+            return nil
+        }
         let point = sample?.point(
             for: app.processIdentifier, now: now,
             focusedAt: focusedAt, screens: NSScreen.screens.map(\.frame)
         )
         IndicatorDiagnostics.record("helper.lookup pid=\(app.processIdentifier) point=\(String(describing: point)) samplePID=\(sample?.pid ?? 0) ageMs=\(sample.map { (now - $0.uptime) * 1000 } ?? -1) sampleRect=\(String(describing: sample?.rect)) focusedAt=\(focusedAt)")
         return point
+    }
+
+    /// The terminal's focused pane changed: the last sample shows the previous pane's caret.
+    func markSampleStale() {
+        guard sample != nil, staleSince == nil else { return }
+        staleSince = ProcessInfo.processInfo.systemUptime
+        // Re-query once the grace ends so a pane switch the helper never resamples (no key event) still shows.
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.staleGrace) { [weak self] in self?.updates.send(()) }
+    }
+
+    private func isWaitingOnStaleSample(for pid: pid_t, now: TimeInterval) -> Bool {
+        guard let staleSince, let sample, sample.pid == pid, sample.uptime < staleSince else { return false }
+        if now - staleSince < Self.staleGrace { return true }
+        guard let pending = pendingConfirmation, pending.uptime > sample.uptime else { return false }
+        return pending.isCurrent(for: pid, now: now, focusedAt: focusedAt)
     }
 
     func suppressesAccessibilityFallback(for app: NSRunningApplication) -> Bool {
@@ -446,6 +488,7 @@ final class CaretPalette {
         if focusApplication?.processIdentifier != app.processIdentifier { return true }
         let now = ProcessInfo.processInfo.systemUptime
         if focus.isAwaitingConfirmation(for: app.processIdentifier, now: now, focusedAt: focusedAt) { return true }
+        if isWaitingOnStaleSample(for: app.processIdentifier, now: now) { return true }
         return textFocus.permitsCaret && pendingConfirmation?.isCurrent(
             for: app.processIdentifier, now: now, focusedAt: focusedAt
         ) == true

@@ -50,6 +50,19 @@ final class PreferencesVM: ObservableObject {
 
     var appKeyboardCache = AppKeyboardCache()
 
+    /// The latest program seen in each terminal's focused pane, kept for runtime only.
+    var terminalPrograms: [Terminal: TerminalProgram] = [:]
+
+    /// The terminal whose floating panel has focus while another app is
+    /// frontmost (`TerminalPanelFocus`); it stands in for the frontmost app.
+    var terminalPanel: NSRunningApplication?
+
+    /// The tty of the latest reading of each terminal's focused pane, shell readings included.
+    var terminalTTYs: [Terminal: String] = [:]
+
+    /// Panes whose program controls the input source (`isp:` commands); runtime only.
+    var terminalControl = TerminalControlTracker<InputSource>()
+
     let runtimeRuleChangeNotifier = RuntimeRuleChangeNotifier()
 
     var runtimeRuleChanges: AnyPublisher<Void, Never> {
@@ -354,6 +367,13 @@ struct Preferences {
         static let isEnableURLSwitchForAside = "isEnableURLSwitchForAside"
         static let isEnableURLSwitchForWhale = "isEnableURLSwitchForWhale"
 
+        static let terminalRules = "terminalRules"
+        static let enabledTerminals = "enabledTerminals"
+        static let didMigrateEnabledTerminals = "didMigrateEnabledTerminals"
+        // Earlier builds' per-terminal switches, read only by `migrateEnabledTerminalsIfNeed`.
+        static let isEnableTerminalRuleForHerdr = "isEnableTerminalRuleForHerdr"
+        static let isEnableTerminalRuleForGhostty = "isEnableTerminalRuleForGhostty"
+
         static let shortcutTriggerMode = "shortcutTriggerMode"
         static let singleModifierTrigger = "singleModifierTrigger"
         static let shortcutModeInputSourceMapping = "shortcutModeInputSourceMapping"
@@ -558,6 +578,15 @@ struct Preferences {
     @UserDefault(Preferences.Key.isEnableURLSwitchForWhale)
     var isEnableURLSwitchForWhale = false
 
+    // MARK: - Terminal Rules
+
+    @CodableUserDefault(Preferences.Key.terminalRules)
+    var terminalRules = [TerminalRule]()
+
+    /// Bundle identifiers of the terminals Terminal Rules apply to.
+    @UserDefault(Preferences.Key.enabledTerminals)
+    var enabledTerminals = [String]()
+
     // MARK: - Appearance
 
     @available(*, deprecated, message: "Use indicatorInfo instead")
@@ -710,6 +739,25 @@ extension Preferences {
         cJKVFixStrategy = CJKVFixStrategy.defaultStrategy
     }
 
+    /// Earlier builds kept one switch per terminal; the first launch of this
+    /// one folds those that were on into `enabledTerminals`. A flag rather than
+    /// the key's absence marks it done: a settings round-trip (an import, the
+    /// test host) can write the key first. The old keys stay for a rollback.
+    mutating func migrateEnabledTerminalsIfNeed() {
+        let defaults = UserDefaults.standard
+        guard !defaults.bool(forKey: Key.didMigrateEnabledTerminals) else { return }
+
+        enabledTerminals = Self.enabledTerminals(enabledTerminals, withLegacySwitchesIn: defaults)
+        defaults.set(true, forKey: Key.didMigrateEnabledTerminals)
+    }
+
+    /// `enabled` plus the terminals whose old switch in `defaults` is on.
+    static func enabledTerminals(_ enabled: [String], withLegacySwitchesIn defaults: UserDefaults) -> [String] {
+        enabled + [(Key.isEnableTerminalRuleForHerdr, Terminal.herdr), (Key.isEnableTerminalRuleForGhostty, .ghostty)]
+            .filter { defaults.bool(forKey: $0.0) && !enabled.contains($0.1.rawValue) }
+            .map(\.1.rawValue)
+    }
+
     private static func hasPersistentValue(forKey key: String) -> Bool {
         guard let bundleIdentifier = Bundle.main.bundleIdentifier,
               let domain = UserDefaults.standard.persistentDomain(forName: bundleIdentifier)
@@ -747,8 +795,10 @@ extension PreferencesVM {
 
         let strategy = preferences.cJKVFixStrategy
 
+        // The window's activation would take key focus from a panel, and a
+        // terminal's panel hides on losing it.
         if strategy == .temporaryInputWindow,
-           NSApplication.isFloatingApp(app?.bundleIdentifier)
+           NSApplication.isFloatingApp(app?.bundleIdentifier) || (app != nil && app == terminalPanel)
         {
             return nil
         }

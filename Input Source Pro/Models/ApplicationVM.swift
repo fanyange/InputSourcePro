@@ -14,15 +14,79 @@ final class ApplicationVM: ObservableObject {
     let cancelBag = CancelBag()
     let preferencesVM: PreferencesVM
 
+    /// Reads a terminal's focused pane; run again to confirm a change to a shell.
+    typealias TerminalLookup = () -> AnyPublisher<TerminalReading, Never>
+
+    private let terminalProgramChanges = PassthroughSubject<Terminal, Never>()
+    /// The terminal in front whose focused pane changed, once per new pane.
+    let terminalPaneFocusChanges = PassthroughSubject<Terminal, Never>()
+    /// Per terminal, the last focused pane read.
+    private var terminalPanes: [Terminal: String] = [:]
+    private let terminalRefreshes = PassthroughSubject<Void, Never>()
+    /// Sources a program switched its focused pane to; `IndicatorVM` selects them.
+    let terminalSwitches = PassthroughSubject<InputSource, Never>()
+    /// Lookups sent with `sendTerminalLookup`, applied latest first so a slow
+    /// one never overwrites a newer one.
+    private let terminalLookups = PassthroughSubject<AnyPublisher<(Terminal, TerminalReading, TerminalLookup), Never>, Never>()
+    private let terminalProgramGate = TerminalProgramGate {
+        Timer.delay(seconds: ApplicationVM.terminalShellConfirmationDelay).mapToVoid().eraseToAnyPublisher()
+    }
+    private lazy var terminalWatcher = TerminalWatcher(
+        refresh: { [weak self] in self?.requestTerminalRefresh() },
+        focusHerdr: { [weak self] in self?.receiveHerdrPane($0) }
+    )
+    private lazy var terminalPanelFocus = TerminalPanelFocus(environment: environment.terminalPanelFocus) { [weak self] in
+        self?.receiveTerminalPanel($0)
+    }
+    private let terminalPanelChanges = PassthroughSubject<Void, Never>()
+    /// Fallbacks for a panel that hides without a notification, while one has focus.
+    private var terminalPanelRecheck: AnyCancellable?
+
     lazy var windowAXNotificationPublisher = ApplicationVM
         .createWindowAXNotificationPublisher(preferencesVM: preferencesVM)
 
-    init(preferencesVM: PreferencesVM) {
+    /// What picking the app rules apply to reads from the system; tests fake it.
+    struct Environment {
+        var frontmostApplication: () -> NSRunningApplication?
+        /// The system-wide focused app when enhanced mode is on, else nil.
+        var focusedApplication: () -> NSRunningApplication?
+        var runningApplications: AnyPublisher<[NSRunningApplication], Never>
+        var isTerminalEnabled: (Terminal) -> Bool
+        /// Asks a terminal other than Herdr for its focused pane; runs off the main thread.
+        var probedProgram: (Terminal) -> TerminalReading
+        var terminalPanelFocus: TerminalPanelFocus.Environment
+
+        @MainActor static func live(_ preferencesVM: PreferencesVM) -> Self {
+            Self(
+                frontmostApplication: { NSWorkspace.shared.frontmostApplication },
+                focusedApplication: {
+                    guard preferencesVM.preferences.isEnhancedModeEnabled,
+                          let elm: UIElement = try? systemWideElement.attribute(.focusedApplication),
+                          let pid = try? elm.pid()
+                    else { return nil }
+                    return NSRunningApplication(processIdentifier: pid)
+                },
+                runningApplications: NSWorkspace.shared.publisher(for: \.runningApplications).eraseToAnyPublisher(),
+                isTerminalEnabled: preferencesVM.isTerminalEnabled,
+                probedProgram: TerminalProbe.program,
+                terminalPanelFocus: .live
+            )
+        }
+    }
+
+    private let environment: Environment
+    /// The running terminals `terminalPanelFocus` watches.
+    private var panelTerminals: [NSRunningApplication] = []
+
+    init(preferencesVM: PreferencesVM, environment: Environment? = nil) {
         self.preferencesVM = preferencesVM
-        appKind = .from(NSWorkspace.shared.frontmostApplication, preferencesVM: preferencesVM)
+        self.environment = environment ?? .live(preferencesVM)
+        appKind = .from(self.environment.frontmostApplication(), preferencesVM: preferencesVM)
 
         activateAccessibilitiesForCurrentApp()
         watchApplicationChange()
+        watchTerminalPanels()
+        watchTerminalLookups()
         watchRuntimeRuleChange()
         watchAppsDiffChange()
     }
@@ -50,30 +114,38 @@ extension ApplicationVM {
                     .mapToVoid()
             }
 
-        Publishers
+        let preferencesVM = preferencesVM
+        let environment = environment
+        let evaluations = Publishers
             .MergeMany([
                 axNotificationBurst.eraseToAnyPublisher(),
                 didActivateAppNotification.eraseToAnyPublisher(),
-                activeSpaceDidChangeNotification.eraseToAnyPublisher()
+                activeSpaceDidChangeNotification.eraseToAnyPublisher(),
+                terminalPanelChanges.eraseToAnyPublisher(),
+                // A terminal's switch flipped while it is in front starts or stops its watch.
+                preferencesVM.runtimeRuleChanges,
             ])
-            .compactMap { [weak self] _ -> NSRunningApplication? in
-                let frontmost = NSWorkspace.shared.frontmostApplication
-                if frontmost?.processIdentifier == ProcessInfo.processInfo.processIdentifier {
-                    return frontmost
+            .eraseToAnyPublisher()
+
+        Self.frontmostSubscriptions(
+            evaluations: evaluations,
+            ruledApp: { () -> NSRunningApplication? in
+                let frontmost = environment.frontmostApplication()
+                let app = Self.ruledApp(
+                    front: frontmost,
+                    isOwn: frontmost?.processIdentifier == ProcessInfo.processInfo.processIdentifier,
+                    panel: preferencesVM.terminalPanel
+                ) { environment.focusedApplication() ?? frontmost }
+                guard let app, !InputSourceSwitcher.isTemporaryInputWindowApplicationActivation(app) else { return nil }
+                return app
+            },
+            watchedTerminal: { app in Terminal(app).flatMap { environment.isTerminalEnabled($0) ? $0 : nil } },
+            subscribe: { [weak self] app, terminal -> AnyPublisher<AppKind, Never> in
+                guard let self else { return Empty().eraseToAnyPublisher() }
+
+                if let terminal {
+                    return self.watchTerminalProgram(app, terminal)
                 }
-                guard self?.preferencesVM.preferences.isEnhancedModeEnabled == true,
-                      let elm: UIElement = try? systemWideElement.attribute(.focusedApplication),
-                      let pid = try? elm.pid()
-                else { return frontmost }
-                return NSRunningApplication(processIdentifier: pid)
-            }
-            .filter { app in
-                !InputSourceSwitcher.isTemporaryInputWindowApplicationActivation(app)
-            }
-            .removeDuplicates()
-            .flatMapLatest { [weak self] (app: NSRunningApplication) -> AnyPublisher<AppKind, Never> in
-                guard let preferencesVM = self?.preferencesVM
-                else { return Empty().eraseToAnyPublisher() }
 
                 guard NSApplication.isBrowser(app)
                 else { return Just(.from(app, preferencesVM: preferencesVM)).eraseToAnyPublisher() }
@@ -98,9 +170,265 @@ extension ApplicationVM {
                     .compactMap { app -> AppKind? in .from(app, preferencesVM: preferencesVM) }
                     .eraseToAnyPublisher()
             }
+        )
             .removeDuplicates(by: { $0.isSameAppOrWebsite(with: $1, detectAddressBar: true) })
             .sink { [weak self] in self?.appKind = $0 }
             .store(in: cancelBag)
+    }
+}
+
+extension ApplicationVM {
+    /// The app rules apply to: ISP's own window when it is in front, else a
+    /// terminal's focused floating panel, else the focused app.
+    static func ruledApp<App>(front: App?, isOwn: Bool, panel: App?, focused: () -> App?) -> App? {
+        if isOwn { return front }
+        return panel ?? focused()
+    }
+
+    /// One subscription for the app rules apply to, picked again on each
+    /// evaluation. It is rebuilt when the app changes, or when whether Terminal
+    /// Rules watch it does (its switch flipped while it is in front).
+    static func frontmostSubscriptions<App: Equatable, Output>(
+        evaluations: AnyPublisher<Void, Never>,
+        ruledApp: @escaping () -> App?,
+        watchedTerminal: @escaping (App) -> Terminal?,
+        subscribe: @escaping (App, Terminal?) -> AnyPublisher<Output, Never>
+    ) -> AnyPublisher<Output, Never> {
+        evaluations
+            // Evaluate at launch too, so a terminal in front is watched
+            // before the user first switches apps.
+            .prepend(())
+            .compactMap { _ -> (app: App, terminal: Terminal?)? in
+                guard let app = ruledApp() else { return nil }
+                return (app, watchedTerminal(app))
+            }
+            .removeDuplicates { (a: (app: App, terminal: Terminal?), b: (app: App, terminal: Terminal?)) in
+                a.app == b.app && a.terminal == b.terminal
+            }
+            .flatMapLatest { (pick: (app: App, terminal: Terminal?)) in subscribe(pick.app, pick.terminal) }
+            .eraseToAnyPublisher()
+    }
+}
+
+extension ApplicationVM {
+    /// Watches every running terminal with Terminal Rules on for a floating
+    /// panel taking focus (Ghostty's quick terminal); see `TerminalPanelFocus`.
+    private func watchTerminalPanels() {
+        let environment = environment
+        let enabledTerminals = preferencesVM.runtimeRuleChanges
+            .prepend(())
+            .map { Terminal.allCases.filter(environment.isTerminalEnabled) }
+
+        environment.runningApplications
+            .combineLatest(enabledTerminals) { apps, enabled in
+                apps.filter { Terminal($0).map(enabled.contains) == true }
+            }
+            .removeDuplicates()
+            .flatMapLatest { [weak self] apps -> AnyPublisher<pid_t, Never> in
+                self?.panelTerminals = apps
+                self?.terminalPanelFocus.watch(Set(apps.map(\.processIdentifier)))
+                return Publishers.MergeMany(apps.map { app in
+                    app.watchAX(TerminalPanelFocus.notifications, [.application, .window])
+                        .mapToVoid()
+                        // Once on watch too: ISP may start with the panel up.
+                        .prepend(())
+                        .throttle(for: .milliseconds(100), scheduler: DispatchQueue.main, latest: true)
+                        .map { app.processIdentifier }
+                })
+                .eraseToAnyPublisher()
+            }
+            .sink { [weak self] in self?.terminalPanelFocus.evaluate($0) }
+            .store(in: cancelBag)
+    }
+
+    private func receiveTerminalPanel(_ pid: pid_t?) {
+        let panel = pid.flatMap { pid in panelTerminals.first { $0.processIdentifier == pid } }
+        IndicatorDiagnostics.record("terminal.panel bundle=\((panel ?? preferencesVM.terminalPanel)?.bundleIdentifier ?? "-") focused=\(panel != nil)")
+        preferencesVM.terminalPanel = panel
+        // Re-evaluates the frontmost app, which the panel now stands in for or hands back to.
+        terminalPanelChanges.send(())
+
+        // While the panel has focus, another app's activation and a slow poll
+        // re-evaluate too, in case it hides without a notification.
+        terminalPanelRecheck = pid.map { pid in
+            NSWorkspace.shared.notificationCenter
+                .publisher(for: NSWorkspace.didActivateApplicationNotification, object: NSWorkspace.shared)
+                .mapToVoid()
+                .merge(with: Timer.interval(seconds: Self.terminalPanelRecheckInterval).mapToVoid())
+                .sink { [weak self] _ in self?.terminalPanelFocus.evaluate(pid) }
+        }
+    }
+
+    static let terminalPanelRecheckInterval: TimeInterval = 0.5
+
+    /// Herdr's view file named another focused pane (`TerminalWatcher`): the
+    /// terminal it shows is read through the latest-wins queue, so an older
+    /// read never overwrites a newer one. Nothing is read when Herdr can't name
+    /// the terminal.
+    private func receiveHerdrPane(_ pane: String) {
+        sendTerminalLookup(for: .herdr) {
+            HerdrDesktop.terminal(ofPane: pane).map { Terminal.herdr.paneProgram(pane: $0) }
+        }
+    }
+
+    /// Reads a terminal's focused pane off the main thread, latest first.
+    func sendTerminalLookup(for terminal: Terminal, _ read: @escaping () -> TerminalReading?) {
+        CaretPalette.shared.markSampleStale()
+        let lookup: TerminalLookup = { TerminalProcess.onQueue(read).compactMap { $0 }.eraseToAnyPublisher() }
+        terminalLookups.send(lookup().map { (terminal, $0, lookup) }.eraseToAnyPublisher())
+    }
+
+    /// What programs wrote on the control pipe: `isp:` lines, handled in order.
+    /// Writes that queued up between reads arrive together; other lines are ignored.
+    func receiveTerminalControl(lines: String) {
+        for line in lines.split(whereSeparator: \.isNewline) {
+            TerminalControlCommand(line: line).map(receiveTerminalControl)
+        }
+    }
+
+    private func requestTerminalRefresh() {
+        // The pane may have changed; the helper's resample usually lands before the lookup resolves.
+        CaretPalette.shared.markSampleStale()
+        terminalRefreshes.send(())
+    }
+
+    /// A program's command to its pane's input source (see `TerminalControlTracker`).
+    /// On the focused pane it switches like a shortcut would, through the same
+    /// select path as rules; elsewhere it only updates the state.
+    private func receiveTerminalControl(_ message: TerminalControlCommand) {
+        // A program's helper (`nvim --embed`) has no tty; its ancestor does, and must be the recorded pid.
+        guard let owner = TerminalProcess.ttyOwner(ofPID: message.pid) else { return }
+        let tty = owner.tty
+        // The pane's latest reading, a shell's too: a program's first command comes before ISP has seen it start.
+        let isFocused = appKind.flatMap { Terminal($0.getApp()) }.flatMap(preferencesVM.focusedTerminalTTY) == tty
+        var target: InputSource?
+
+        func resolve(_ id: String) -> InputSource? {
+            let source = InputSource.resolvePersistedIdentifier(id)
+            if source == nil {
+                IndicatorDiagnostics.record("terminal.isp unresolved id=\(id)")
+            }
+            return source
+        }
+
+        switch message.command {
+        case let .select(id):
+            guard let source = resolve(id) else { return }
+            preferencesVM.terminalControl.select(source, on: tty, pid: owner.pid)
+            target = source
+        case let .push(id):
+            guard let source = resolve(id) else { return }
+            preferencesVM.terminalControl.push(source, on: tty, pid: owner.pid, live: isFocused ? InputSource.getCurrentInputSource() : nil)
+            target = source
+        case .pop:
+            target = preferencesVM.terminalControl.pop(on: tty, pid: owner.pid)
+        case .release:
+            preferencesVM.terminalControl.release(tty)
+            if isFocused { preferencesVM.runtimeRuleChangeNotifier.notify() }
+        }
+        if isFocused, let target { terminalSwitches.send(target) }
+        IndicatorDiagnostics.record("terminal.isp pid=\(owner.pid)\(owner.pid == message.pid ? "" : " from=\(message.pid)") tty=\(tty) cmd=\(message.command.name) focused=\(isFocused) source=\(isFocused ? target?.persistentIdentifier ?? "-" : "-")")
+    }
+
+    private func watchTerminalLookups() {
+        terminalLookups
+            .switchToLatest()
+            .sink { [weak self] terminal, reading, lookup in
+                self?.receiveTerminalProgram(reading, for: terminal, recheck: lookup)
+            }
+            .store(in: cancelBag)
+    }
+
+    /// How long a change from a program to a shell waits before it is read again.
+    static let terminalShellConfirmationDelay: TimeInterval = 0.25
+
+    private func receiveTerminalProgram(_ reading: TerminalReading, for terminal: Terminal, recheck: @escaping TerminalLookup) {
+        terminalWatcher.follow(reading.trail, for: terminal)
+        // Before the gate: a held shell is always in the same pane, so this fires once, right away.
+        if let pane = reading.pane, terminalPanes[terminal] != pane {
+            terminalPanes[terminal] = pane
+            if appKind.flatMap({ Terminal($0.getApp()) }) == terminal {
+                IndicatorDiagnostics.record("terminal.paneFocus bundle=\(terminal.rawValue) pane=\(pane)")
+                terminalPaneFocusChanges.send(terminal)
+            }
+        }
+        terminalProgramGate.receive(reading, current: preferencesVM.terminalPrograms[terminal], for: terminal, recheck: recheck) { [weak self] reading in
+            guard let self, self.updateTerminalProgram(reading, for: terminal) else { return }
+            self.terminalProgramChanges.send(terminal)
+        }
+    }
+
+    /// Records a terminal's program; true when it changed.
+    private func updateTerminalProgram(_ reading: TerminalReading, for terminal: Terminal) -> Bool {
+        let program = reading.program
+        preferencesVM.terminalTTYs[terminal] = reading.tty
+        // A shell on the tty means the program is gone, whether or not it let go,
+        // unless its process lives on (Ctrl-Z) or this read predates it.
+        if program == nil, let tty = reading.tty {
+            preferencesVM.terminalControl.releaseUnlessAlive(tty) { pid, tty in
+                kill(pid, 0) == 0 && TerminalProcess.ttyPath(ofPID: pid) == tty
+            }
+        }
+        let changed = preferencesVM.terminalPrograms[terminal] != program
+        IndicatorDiagnostics.record("terminal.program bundle=\(terminal.rawValue) program=\(program?.id ?? "shell") pane=\(reading.pane ?? "-") changed=\(changed)")
+        if changed {
+            preferencesVM.terminalPrograms[terminal] = program
+        }
+        return changed
+    }
+
+    private func watchTerminalProgram(_ app: NSRunningApplication, _ terminal: Terminal) -> AnyPublisher<AppKind, Never> {
+        let preferencesVM = preferencesVM
+        let probedProgram = environment.probedProgram
+
+        // A refresh (`TerminalWatcher`) reads the remembered tty again, and once
+        // more a moment later in case the change it saw had not finished.
+        var lookups: AnyPublisher<() -> AnyPublisher<TerminalReading?, Never>, Never> = terminalRefreshes
+            .merge(with: terminalRefreshes.delay(for: .milliseconds(100), scheduler: DispatchQueue.main))
+            .throttle(for: .milliseconds(100), scheduler: DispatchQueue.main, latest: true)
+            .map { { TerminalProcess.onQueue(terminal.refreshedProgram) } }
+            .eraseToAnyPublisher()
+
+        if terminal != .herdr {
+            // Re-ask which pane has focus on activation and on AX changes: a tab
+            // or split switch may announce itself only as a title change, and
+            // Alacritty's only per-window signal is a window switch.
+            let probes = app.watchAX([
+                .focusedUIElementChanged,
+                .focusedWindowChanged,
+                .titleChanged,
+                .windowCreated,
+            ], [.application, .window])
+                .filter { $0.notification != .windowCreated }
+                .mapToVoid()
+                .throttle(for: .milliseconds(300), scheduler: DispatchQueue.main, latest: true)
+                .prepend(())
+                .map { { TerminalProcess.onQueue { Optional(probedProgram(terminal)) } } }
+            lookups = lookups.merge(with: probes).eraseToAnyPublisher()
+        }
+
+        // Lookups run in order on one queue, so the latest one has the newest
+        // answer. An outer nil means there was nothing to read. Results publish
+        // through terminalProgramChanges, held or not.
+        let lookedUp = lookups
+            .map { lookup in lookup().map { ($0, lookup) } }
+            .switchToLatest()
+            .compactMap { [weak self] result, lookup -> Void? in
+                guard let reading = result else { return nil }
+                self?.receiveTerminalProgram(reading, for: terminal) {
+                    lookup().compactMap { $0 }.eraseToAnyPublisher()
+                }
+                return nil
+            }
+
+        // The last known program answers at once; a probe, lookup or refresh corrects it.
+        return terminalProgramChanges
+            .filter { $0 == terminal }
+            .mapToVoid()
+            .merge(with: lookedUp, terminalWatcher.watching(terminal).setOutputType(to: Void.self))
+            .prepend(())
+            .map { AppKind.from(app, preferencesVM: preferencesVM) }
+            .eraseToAnyPublisher()
     }
 }
 
@@ -109,7 +437,7 @@ extension ApplicationVM {
         preferencesVM.runtimeRuleChanges
             .compactMap { [weak self] _ -> AppKind? in
                 guard let self = self else { return nil }
-                let app = self.appKind?.getApp() ?? NSWorkspace.shared.frontmostApplication
+                let app = self.appKind?.getApp() ?? self.environment.frontmostApplication()
                 return AppKind.from(app, preferencesVM: self.preferencesVM)
             }
             .filter { appKind in
@@ -130,7 +458,53 @@ extension ApplicationVM {
             .compactMap { $0 }
             .filter { [weak self] _ in self?.preferencesVM.preferences.isEnhancedModeEnabled == true }
             .filter { [weak self] in self?.preferencesVM.isHideIndicator($0) != true }
+            // Browser URL and terminal program changes republish the same app; each activation is several AX round trips.
+            .removeDuplicates { $0.getApp().processIdentifier == $1.getApp().processIdentifier }
             .sink { $0.getApp().activateAccessibilities() }
             .store(in: cancelBag)
+    }
+}
+
+extension ApplicationVM {
+    /// Publishes terminal lookup results. A change from a program to a shell in
+    /// the same pane is believed only once `recheck` still reads a shell after
+    /// the hold: the focused pane can read as a shell for a moment (focus
+    /// briefly away), and publishing that flips the input source twice. A
+    /// shell in another pane, or where either pane is unknown, is a pane
+    /// switch; it and every other change publish at once, ending any hold.
+    @MainActor
+    final class TerminalProgramGate {
+        private let hold: () -> AnyPublisher<Void, Never>
+        /// Per terminal, the pane whose shell is on hold, and the wait for its recheck.
+        private var holds: [Terminal: (pane: String, recheck: AnyCancellable)] = [:]
+
+        init(hold: @escaping () -> AnyPublisher<Void, Never>) {
+            self.hold = hold
+        }
+
+        func receive(
+            _ reading: TerminalReading,
+            current: TerminalProgram?,
+            for terminal: Terminal,
+            recheck: @escaping TerminalLookup,
+            publish: @escaping (TerminalReading) -> Void
+        ) {
+            guard let current, reading.program == nil, let pane = reading.pane, pane == current.pane else {
+                holds[terminal] = nil
+                publish(reading)
+                return
+            }
+            // Another read of the held shell (a refresh reads twice) keeps the first deadline.
+            guard holds[terminal]?.pane != pane else { return }
+
+            IndicatorDiagnostics.record("terminal.hold program=\(current.id) pane=\(pane)")
+            holds[terminal] = (pane, hold()
+                .first()
+                .flatMap { _ in recheck() }
+                .sink(
+                    receiveCompletion: { [weak self] _ in self?.holds[terminal] = nil },
+                    receiveValue: publish
+                ))
+        }
     }
 }

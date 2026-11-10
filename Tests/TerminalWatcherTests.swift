@@ -1,0 +1,761 @@
+import Combine
+import Darwin
+import XCTest
+@testable import Input_Source_Pro
+
+@MainActor
+final class TerminalWatcherTests: XCTestCase {
+    /// A watcher on fake polls, process table, zellij, connections and timers, all driven by hand.
+    @MainActor
+    private final class Harness {
+        final class Poll {
+            let interval: TimeInterval
+            let check: () -> String?
+            let fire: (String) -> Void
+            var isCancelled = false
+            var isDone = false
+
+            init(interval: TimeInterval, check: @escaping () -> String?, fire: @escaping (String) -> Void) {
+                self.interval = interval
+                self.check = check
+                self.fire = fire
+            }
+
+            /// One timer tick, as the live poll runs it: a change fires once and ends the poll.
+            func tick() {
+                guard !isCancelled, !isDone, let change = check() else { return }
+                isDone = true
+                fire(change)
+            }
+        }
+
+        /// One watch of Herdr's view file.
+        final class HerdrView {
+            let send: (String?) -> Void
+            var isCancelled = false
+
+            init(send: @escaping (String?) -> Void) {
+                self.send = send
+            }
+        }
+
+        var polls: [Poll] = []
+        var herdrViews: [HerdrView] = []
+        var foregroundPgids: [pid_t: pid_t] = [:]
+        var zellijPane: Multiplexer.Pane?
+        var zellijQueries: [String] = []
+        var reachable: Set<TerminalWatcher.Connection> = []
+        var attempts: [TerminalWatcher.Connection] = []
+        var sends: [TerminalWatcher.Connection: (TerminalWatcher.ConnectionEvent) -> Void] = [:]
+        var closed: [TerminalWatcher.Connection] = []
+        var timers: [(seconds: TimeInterval, subject: PassthroughSubject<Date, Never>)] = []
+        var refreshes = 0
+        var focusedHerdrPanes: [String] = []
+        private var front: AnyCancellable?
+
+        lazy var watcher = TerminalWatcher(
+            environment: TerminalWatcher.Environment(
+                poll: { [unowned self] interval, check, fire in
+                    let poll = Poll(interval: interval, check: check, fire: fire)
+                    polls.append(poll)
+                    return AnyCancellable { poll.isCancelled = true }
+                },
+                foregroundPgid: { [unowned self] in foregroundPgids[$0] },
+                zellijPane: { [unowned self] session in
+                    zellijQueries.append(session)
+                    return zellijPane
+                },
+                connect: { [unowned self] connection, send in
+                    attempts.append(connection)
+                    guard reachable.contains(connection) else { return nil }
+                    sends[connection] = send
+                    return AnyCancellable { [weak self] in self?.closed.append(connection) }
+                },
+                // Weak: tearing the harness down leaves the front, which asks for the grace timer.
+                delay: { [weak self] seconds in
+                    let subject = PassthroughSubject<Date, Never>()
+                    self?.timers.append((seconds, subject))
+                    return subject.eraseToAnyPublisher()
+                },
+                herdrView: { [unowned self] send in
+                    let view = HerdrView(send: send)
+                    herdrViews.append(view)
+                    return AnyCancellable { view.isCancelled = true }
+                }
+            ),
+            refresh: { [unowned self] in refreshes += 1 },
+            focusHerdr: { [unowned self] in focusedHerdrPanes.append($0) }
+        )
+
+        var livePolls: [Poll] { polls.filter { !$0.isCancelled && !$0.isDone } }
+
+        func bringToFront(_ terminal: Terminal) {
+            front = watcher.watching(terminal).sink { _ in }
+        }
+
+        func leaveFront() { front = nil }
+
+        func tick() { livePolls.forEach { $0.tick() } }
+
+        /// Fires the oldest pending timer, which must be for `seconds`.
+        func fireTimer(_ seconds: TimeInterval, file: StaticString = #filePath, line: UInt = #line) {
+            guard !timers.isEmpty else { return XCTFail("No timer pending", file: file, line: line) }
+            let timer = timers.removeFirst()
+            XCTAssertEqual(timer.seconds, seconds, file: file, line: line)
+            timer.subject.send(Date())
+        }
+    }
+
+    private func trail(ttys: [(pid_t, pid_t)] = [], tmux: Bool = false, herdr: [String] = [], zellij: TerminalTrail.Zellij? = nil) -> TerminalTrail {
+        TerminalTrail(ttys: ttys.map { TerminalTrail.TTY(pid: $0.0, foregroundPgid: $0.1) }, tmux: tmux, herdrSockets: herdr, zellij: zellij)
+    }
+
+    // MARK: Lifecycle
+
+    func testWatchesOnlyWhileTheTerminalIsFrontmost() {
+        let harness = Harness()
+        harness.watcher.follow(trail(ttys: [(10, 100)]), for: .ghostty)
+        XCTAssertTrue(harness.polls.isEmpty, "Not frontmost: nothing watched")
+
+        harness.bringToFront(.ghostty)
+        XCTAssertEqual(harness.livePolls.map(\.interval), [TerminalWatcher.libprocInterval], "Picks up the remembered trail")
+
+        harness.watcher.follow(trail(ttys: [(20, 200)]), for: .herdr)
+        XCTAssertEqual(harness.livePolls.count, 1, "Another terminal's lookup changes nothing")
+
+        harness.leaveFront()
+        XCTAssertTrue(harness.livePolls.isEmpty, "Leaving the front stops polling at once")
+
+        harness.foregroundPgids[10] = 101
+        harness.tick()
+        XCTAssertEqual(harness.refreshes, 0)
+    }
+
+    func testANewLookupReplacesThePolls() {
+        let harness = Harness()
+        harness.bringToFront(.ghostty)
+        harness.watcher.follow(trail(ttys: [(10, 100)]), for: .ghostty)
+        let first = harness.livePolls
+        harness.watcher.follow(trail(ttys: [(20, 200)]), for: .ghostty)
+
+        XCTAssertTrue(first.allSatisfy(\.isCancelled))
+        XCTAssertEqual(harness.livePolls.count, 1)
+        first[0].fire("late") // already queued for the main thread when it was replaced
+        XCTAssertEqual(harness.refreshes, 0, "A replaced poll's change is ignored")
+    }
+
+    // MARK: libproc
+
+    func testLibprocTriggersOnlyWhenTheForegroundGroupChanges() {
+        let harness = Harness()
+        harness.foregroundPgids = [10: 100, 20: 200]
+        harness.bringToFront(.ghostty)
+        harness.watcher.follow(trail(ttys: [(10, 100), (20, 200)]), for: .ghostty)
+
+        for _ in 0 ..< 5 { harness.tick() }
+        XCTAssertEqual(harness.refreshes, 0, "Same numbers: nothing to do")
+
+        harness.foregroundPgids[20] = 201
+        harness.tick()
+        harness.tick()
+        XCTAssertEqual(harness.refreshes, 1, "A change fires once; the lookup it causes restarts the poll")
+        XCTAssertTrue(harness.livePolls.isEmpty)
+
+        harness.watcher.follow(trail(ttys: [(10, 100), (20, 201)]), for: .ghostty)
+        harness.tick()
+        XCTAssertEqual(harness.refreshes, 1)
+
+        harness.foregroundPgids[10] = nil // the shell is gone
+        harness.tick()
+        XCTAssertEqual(harness.refreshes, 2)
+    }
+
+    func testTTYIsWatchedThroughItsEarliestReadableProcess() {
+        let processes = [
+            TerminalProcess(pid: 9, pgid: 9, foregroundPgid: 9, startTime: 3, comm: "nvim"),
+            TerminalProcess(pid: 5, pgid: 5, foregroundPgid: 9, startTime: 1, comm: "login"),
+            TerminalProcess(pid: 6, pgid: 6, foregroundPgid: 9, startTime: 2, comm: "zsh"),
+        ]
+        let rootLogin: pid_t = 5
+        let tty = TerminalTrail.TTY(watching: processes) { $0 == rootLogin ? nil : 1 }
+
+        XCTAssertEqual(tty, TerminalTrail.TTY(pid: 6, foregroundPgid: 9), "Baseline is the table's value, not the new read")
+        XCTAssertNil(TerminalTrail.TTY(watching: processes) { _ in nil })
+    }
+
+    func testLibprocReadsOwnProcess() {
+        let pid = getpid()
+        XCTAssertNotNil(TerminalTrail.foregroundPgid(ofPID: pid))
+        XCTAssertNil(TerminalTrail.foregroundPgid(ofPID: -1))
+    }
+
+    // MARK: zellij
+
+    func testZellijPollsItsClientListEveryQuarterSecond() {
+        let harness = Harness()
+        let pane = Multiplexer.Pane.program(nil, label: "zellij:s/terminal_1")
+        harness.zellijPane = pane
+        harness.bringToFront(.ghostty)
+        harness.watcher.follow(trail(ttys: [(10, 100)], zellij: TerminalTrail.Zellij(session: "s", pane: pane)), for: .ghostty)
+        harness.foregroundPgids[10] = 100
+
+        XCTAssertEqual(harness.livePolls.map(\.interval).sorted(), [TerminalWatcher.libprocInterval, TerminalWatcher.zellijInterval])
+        XCTAssertEqual(TerminalWatcher.zellijInterval, 0.5)
+
+        harness.tick()
+        harness.zellijPane = nil // zellij didn't answer
+        harness.tick()
+        XCTAssertEqual(harness.refreshes, 0)
+        XCTAssertEqual(harness.zellijQueries, ["s", "s"])
+
+        harness.zellijPane = .program(TerminalProgram(key: "nvim", pane: "zellij:s/terminal_1"), label: "zellij:s/terminal_1")
+        harness.tick()
+        XCTAssertEqual(harness.refreshes, 1)
+    }
+
+    // MARK: Herdr view file
+
+    func testHerdrViewFocusesEachNewPane() throws {
+        let harness = Harness()
+        harness.bringToFront(.herdr)
+        let view = try XCTUnwrap(harness.herdrViews.first)
+        XCTAssertEqual(harness.herdrViews.count, 1)
+
+        view.send("pA")
+        XCTAssertEqual(harness.focusedHerdrPanes, ["pA"], "The first read is Herdr's focus on coming to the front")
+        view.send("pA") // another file in the directory changed
+        view.send(nil) // unreadable
+        XCTAssertEqual(harness.focusedHerdrPanes, ["pA"])
+
+        view.send("pB")
+        view.send("pB")
+        view.send(nil)
+        view.send("pB")
+        XCTAssertEqual(harness.focusedHerdrPanes, ["pA", "pB"], "Same pane after an unreadable read: nothing")
+        view.send("pA")
+        XCTAssertEqual(harness.focusedHerdrPanes, ["pA", "pB", "pA"])
+        XCTAssertEqual(harness.refreshes, 0, "A pane switch is a focus, not a refresh of the remembered tty")
+
+        harness.watcher.follow(trail(ttys: [(10, 100)]), for: .herdr)
+        XCTAssertEqual(harness.herdrViews.count, 1, "A lookup leaves the view watch alone")
+    }
+
+    /// Coming to the front, the view watch's first read is the only lookup of
+    /// Herdr's focus: a switch made right after it is a change from that read,
+    /// never a baseline taken after another lookup already read the old pane.
+    func testHerdrSwitchRightAfterComingToTheFrontIsFocused() throws {
+        let harness = Harness()
+        harness.bringToFront(.herdr)
+        let view = try XCTUnwrap(harness.herdrViews.last)
+        view.send("pA") // read on coming to the front
+        view.send("pB") // switched at once
+        XCTAssertEqual(harness.focusedHerdrPanes, ["pA", "pB"], "The latest focus is pB")
+    }
+
+    func testHerdrViewIsWatchedOnlyWhileHerdrIsFrontmost() throws {
+        let harness = Harness()
+        harness.bringToFront(.ghostty)
+        XCTAssertTrue(harness.herdrViews.isEmpty, "Only Herdr's desktop app has a view file")
+
+        harness.bringToFront(.herdr)
+        let first = try XCTUnwrap(harness.herdrViews.last)
+        first.send(nil) // unreadable
+        first.send("pA")
+        XCTAssertEqual(harness.focusedHerdrPanes, ["pA"], "Focused once readable")
+
+        harness.leaveFront()
+        XCTAssertTrue(first.isCancelled, "Leaving the front stops at once")
+        first.send("pB") // already queued for the main thread
+        XCTAssertEqual(harness.focusedHerdrPanes, ["pA"])
+
+        harness.bringToFront(.herdr)
+        let second = try XCTUnwrap(harness.herdrViews.last)
+        XCTAssertEqual(harness.herdrViews.count, 2)
+        second.send("pA")
+        XCTAssertEqual(harness.focusedHerdrPanes, ["pA", "pA"], "Back in front: focused again, whatever was pushed meanwhile")
+        second.send("pC")
+        XCTAssertEqual(harness.focusedHerdrPanes, ["pA", "pA", "pC"])
+    }
+
+    /// The live watch on a real (temporary) directory: Herdr replaces its view
+    /// file by rename, which the directory reports and the old file never would.
+    func testWatchDirectorySeesAFileReplacedByRename() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("view.json")
+        func view(_ pane: String) -> Data {
+            Data(#"{"active":"s","spaces":{"s":"t"},"tabs":{"t":{"focused":"\#(pane)","before":[]}}}"#.utf8)
+        }
+        try view("pA").write(to: file)
+
+        var reads: [String?] = []
+        let watch = TerminalWatcher.Environment.watchDirectory(
+            directory.path,
+            read: { FileManager.default.contents(atPath: file.path).flatMap(HerdrDesktop.focusedPane(fromView:)) },
+            send: { reads.append($0) }
+        )
+        defer { watch.cancel() }
+        waitUntil("the first read") { reads == ["pA"] }
+
+        try view("pB").write(to: file, options: .atomic) // a temporary file renamed over it
+        waitUntil("a read after the rename") { reads.last == "pB" }
+    }
+
+    private func waitUntil(_ what: String, timeout: TimeInterval = 5, _ condition: () -> Bool, file: StaticString = #filePath, line: UInt = #line) {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition() {
+            guard Date() < deadline else { return XCTFail("Timed out: \(what)", file: file, line: line) }
+            RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+        }
+    }
+
+    // MARK: Connections
+
+    func testTmuxAttachesWithBackoffAndReconnectsAfterTheServerGoes() {
+        let harness = Harness()
+        harness.bringToFront(.ghostty)
+        harness.watcher.follow(trail(tmux: true), for: .ghostty)
+        XCTAssertTrue(harness.attempts.isEmpty, "The first attempt waits for its delay")
+
+        harness.fireTimer(0.5)
+        XCTAssertEqual(harness.attempts, [.tmux], "Server not up: retried")
+        harness.reachable = [.tmux]
+        harness.fireTimer(1)
+        XCTAssertEqual(harness.attempts, [.tmux, .tmux])
+        XCTAssertTrue(harness.timers.isEmpty, "Attached: no more retries")
+
+        harness.watcher.follow(trail(tmux: true), for: .ghostty)
+        XCTAssertEqual(harness.attempts.count, 2, "One connection per server")
+
+        harness.sends[.tmux]?(.changed)
+        XCTAssertEqual(harness.refreshes, 1)
+
+        harness.sends[.tmux]?(.closed(wasReady: true))
+        XCTAssertEqual(harness.closed, [.tmux])
+        harness.fireTimer(0.5)
+        XCTAssertEqual(harness.attempts.count, 3, "Lost after its handshake: attached again")
+    }
+
+    func testAConnectionRefusedBeforeItsHandshakeWaitsForTheNextLookup() {
+        let harness = Harness()
+        harness.reachable = [.tmux]
+        harness.bringToFront(.ghostty)
+        harness.watcher.follow(trail(tmux: true), for: .ghostty)
+        harness.fireTimer(0.5)
+
+        harness.sends[.tmux]?(.closed(wasReady: false))
+        XCTAssertTrue(harness.timers.isEmpty, "No retry loop")
+
+        harness.watcher.follow(trail(tmux: true), for: .ghostty)
+        harness.fireTimer(0.5)
+        XCTAssertEqual(harness.attempts.count, 2)
+    }
+
+    func testConnectionsDroppedBeforeTheirHandshakeBackOffFurtherEachTime() {
+        let harness = Harness()
+        harness.reachable = [.tmux]
+        harness.bringToFront(.ghostty)
+        harness.watcher.follow(trail(tmux: true), for: .ghostty)
+        harness.fireTimer(0.5)
+
+        // No handshake in time, or the server went away after it was found: each drop in a row waits longer.
+        for (drop, seconds) in [1, 2, 4, 5, 5].enumerated() {
+            harness.sends[.tmux]?(.dropped)
+            XCTAssertEqual(harness.closed.count, drop + 1)
+            harness.fireTimer(TimeInterval(seconds))
+            XCTAssertEqual(harness.attempts.count, drop + 2, "Retried")
+        }
+
+        // A handshake ends the run: the next loss starts the backoff over.
+        harness.sends[.tmux]?(.closed(wasReady: true))
+        harness.fireTimer(0.5)
+        XCTAssertEqual(harness.attempts.count, 7)
+    }
+
+    func testConnectionsOutliveLeavingTheFrontForAGracePeriod() {
+        let socket = "/tmp/herdr.sock"
+        let herdr = TerminalWatcher.Connection.herdr(socket: socket)
+        let harness = Harness()
+        harness.reachable = [herdr]
+        harness.bringToFront(.herdr)
+        harness.watcher.follow(trail(herdr: [socket]), for: .herdr)
+        harness.fireTimer(0.5)
+        XCTAssertEqual(harness.attempts, [herdr])
+
+        harness.leaveFront()
+        harness.sends[herdr]?(.changed)
+        XCTAssertEqual(harness.refreshes, 0, "Not frontmost: events are ignored")
+        XCTAssertTrue(harness.closed.isEmpty)
+
+        harness.bringToFront(.herdr)
+        harness.fireTimer(TerminalWatcher.connectionGrace) // cancelled by coming back
+        XCTAssertTrue(harness.closed.isEmpty, "Back in time: the connection is reused")
+        XCTAssertEqual(harness.attempts.count, 1)
+        harness.sends[herdr]?(.changed)
+        XCTAssertEqual(harness.refreshes, 1)
+
+        harness.leaveFront()
+        harness.fireTimer(TerminalWatcher.connectionGrace)
+        XCTAssertEqual(harness.closed, [herdr])
+    }
+
+    // MARK: Lines
+
+    func testTmuxControlModeLines() {
+        let parse = { (line: String) in TerminalWatcher.Line.tmux(Substring(line)) }
+        XCTAssertEqual(parse("%end 1794042581 321 0"), .ready)
+        XCTAssertEqual(parse("%window-pane-changed @0 %1"), .changed)
+        XCTAssertEqual(parse("%session-window-changed $0 @1"), .changed)
+        XCTAssertEqual(parse("%client-session-changed /dev/ttys003 $1 B"), .changed)
+        XCTAssertEqual(parse("%session-changed $1 B"), .changed)
+        for line in ["%begin 1794042581 321 0", "%sessions-changed", "%window-renamed @2 x", "%layout-change @0 x",
+                     "%output %1 %window-pane-changed", "%exit", "", "window-pane-changed"] {
+            XCTAssertNil(parse(line), line)
+        }
+    }
+
+    func testHerdrsThreeFocusEventsCountOnce() {
+        var buffer = Array("""
+        {"id":"isp","result":{"type":"subscription_started"}}
+        {"data":{"pane_id":"w1:p2","type":"pane_focused","workspace_id":"w1"},"event":"pane_focused"}
+        {"data":{"tab_id":"w1:t2","type":"tab_focused"},"event":"tab_focused"}
+        {"data":{"workspace_id":"w1","type":"workspace_focused"},"event":"workspace_focused"}
+        {"data":{"pane_id":"w1:p3","type":"pane_focused"},"event":"pane_focused"}
+        {"data":{"pane_id":
+        """.utf8)
+        var isReady = false
+
+        XCTAssertTrue(TerminalWatcher.Line.scan(&buffer, isReady: &isReady, parse: TerminalWatcher.Line.herdr))
+        XCTAssertTrue(isReady)
+        XCTAssertEqual(String(decoding: buffer, as: UTF8.self), #"{"data":{"pane_id":"#, "A partial line waits for the rest")
+
+        buffer += Array(#""w1:p4"},"event":"tab_focused"}"#.utf8) + [UInt8(ascii: "\n")]
+        XCTAssertFalse(TerminalWatcher.Line.scan(&buffer, isReady: &isReady, parse: TerminalWatcher.Line.herdr))
+        XCTAssertTrue(buffer.isEmpty)
+        XCTAssertNil(TerminalWatcher.Line.herdr(#"{"id":"isp","error":{"code":"bad"}}"#))
+    }
+
+    func testStreamSendsOneChangePerReadThenClosed() {
+        var fds: [Int32] = [0, 0]
+        XCTAssertEqual(pipe(&fds), 0)
+        var events: [TerminalWatcher.ConnectionEvent] = []
+        let closed = expectation(description: "closed")
+        let lock = NSLock()
+        let stream = TerminalWatcher.Environment.stream(fd: fds[0], timeout: 5, parse: TerminalWatcher.Line.tmux, send: { event in
+            lock.withLock { events.append(event) }
+            if case .closed = event { closed.fulfill() }
+        }, onClose: {})
+
+        let lines = Array("%begin 1 1 0\n%end 1 1 0\n%session-changed $1 B\n%window-pane-changed @0 %1\n".utf8)
+        XCTAssertEqual(write(fds[1], lines, lines.count), lines.count)
+        close(fds[1])
+        wait(for: [closed], timeout: 5)
+
+        XCTAssertEqual(lock.withLock { events }, [.changed, .closed(wasReady: true)])
+        stream.cancel()
+    }
+
+    /// Opening runs off the caller's thread: `attach` returns while `open` is
+    /// still held, and `open` only goes on once the caller lets it.
+    func testAttachReturnsBeforeItOpens() {
+        let release = DispatchSemaphore(value: 0)
+        let finished = expectation(description: "open finished")
+        let lock = NSLock()
+        var openedOnMain = true
+        var released = DispatchTimeoutResult.timedOut
+
+        let connection = TerminalWatcher.Environment.attach(timeout: 60, parse: TerminalWatcher.Line.herdr, send: { _ in }) {
+            lock.withLock { openedOnMain = Thread.isMainThread }
+            // Run in line, this would wait out its timeout: the signal comes only after `attach` returns.
+            let result = release.wait(timeout: .now() + 5)
+            lock.withLock { released = result }
+            finished.fulfill()
+            return nil
+        }
+        release.signal()
+        wait(for: [finished], timeout: 5)
+        lock.withLock {
+            XCTAssertEqual(released, .success, "attach returned before open finished")
+            XCTAssertFalse(openedOnMain)
+        }
+        connection.cancel()
+    }
+
+    /// A server that listens but never accepts: the missing handshake ends in `.dropped`.
+    func testAServerThatNeverAnswersIsDropped() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let path = directory.appendingPathComponent("s.sock").path
+        let server = try XCTUnwrap(Self.listen(at: path))
+        defer { close(server) }
+
+        let environment = TerminalWatcher.Environment.live(handshakeTimeout: 0.2)
+        XCTAssertNil(environment.connect(.herdr(socket: directory.appendingPathComponent("none.sock").path)) { _ in },
+                     "Nothing listens: nil at once")
+
+        var events: [TerminalWatcher.ConnectionEvent] = []
+        let dropped = expectation(description: "dropped")
+        let connection = environment.connect(.herdr(socket: path)) { event in
+            XCTAssertTrue(Thread.isMainThread)
+            events.append(event)
+            dropped.fulfill()
+        }
+        XCTAssertNotNil(connection)
+        wait(for: [dropped], timeout: 5)
+        XCTAssertEqual(events, [.dropped])
+        connection?.cancel()
+    }
+
+    /// Cancelled while it was opening: what opens is closed at once, and nothing is sent.
+    func testAConnectionThatOpensAfterItsCancelIsClosed() {
+        var fds: [Int32] = [0, 0]
+        XCTAssertEqual(pipe(&fds), 0)
+        defer { close(fds[1]) }
+        let opening = expectation(description: "opening")
+        let cancelled = DispatchSemaphore(value: 0)
+        let closed = expectation(description: "closed")
+        var events: [TerminalWatcher.ConnectionEvent] = []
+
+        // A deadline past the test: anything sent would come from the cancel itself.
+        let connection = TerminalWatcher.Environment.attach(timeout: 60, parse: TerminalWatcher.Line.tmux, send: { events.append($0) }) {
+            opening.fulfill()
+            _ = cancelled.wait(timeout: .now() + 5)
+            return (fds[0], { closed.fulfill() })
+        }
+        guard XCTWaiter().wait(for: [opening], timeout: 5) == .completed else {
+            cancelled.signal()
+            connection.cancel()
+            return XCTFail("open never ran")
+        }
+        connection.cancel()
+        cancelled.signal()
+        wait(for: [closed], timeout: 5)
+
+        // Events hop to the main queue; one turn of it delivers any already sent.
+        let drained = expectation(description: "main queue drained")
+        DispatchQueue.main.async { drained.fulfill() }
+        wait(for: [drained], timeout: 5)
+        XCTAssertEqual(events, [], "Nothing after cancel")
+    }
+
+    /// A unix socket at `path` that listens and never accepts on its own.
+    private static func listen(at path: String) -> Int32? {
+        let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { return nil }
+        var address = sockaddr_un()
+        address.sun_family = sa_family_t(AF_UNIX)
+        withUnsafeMutableBytes(of: &address.sun_path) { $0.copyBytes(from: path.utf8.prefix($0.count - 1)) }
+        let bound = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
+        }
+        guard bound == 0, Darwin.listen(fd, 8) == 0 else {
+            Darwin.close(fd)
+            return nil
+        }
+        return fd
+    }
+
+    // MARK: CLI runs
+
+    func testCLIOutputIsNilOnceTheWatchdogKillsIt() {
+        var timeouts: [TimeInterval] = []
+        let output = Multiplexer.output(of: "/bin/sleep", arguments: ["30"], timeout: 0.5) { timeout, kill in
+            timeouts.append(timeout)
+            kill() // the deadline passes at once
+        }
+        XCTAssertNil(output, "Killed when it hangs")
+        XCTAssertEqual(timeouts, [0.5])
+    }
+
+    /// Smoke test on real processes.
+    func testCLIOutputOnlyOnSuccess() {
+        XCTAssertEqual(Multiplexer.output(of: "/bin/echo", arguments: ["a b", "c"]), "a b c\n")
+        XCTAssertNil(Multiplexer.output(of: "/usr/bin/false", arguments: []))
+        XCTAssertNil(Multiplexer.output(of: "/nonexistent", arguments: []))
+    }
+
+    // MARK: herdr sessions
+
+    func testHerdrSessionFromItsClientArguments() {
+        XCTAssertNil(Multiplexer.herdrSession(fromArguments: ["herdr"]))
+        XCTAssertEqual(Multiplexer.herdrSession(fromArguments: ["herdr", "--session", "work"]), "work")
+        XCTAssertEqual(Multiplexer.herdrSession(fromArguments: ["herdr", "--session=work"]), "work")
+        XCTAssertEqual(Multiplexer.herdrSession(fromArguments: ["herdr", "session", "attach", "work"]), "work")
+        XCTAssertNil(Multiplexer.herdrSession(fromArguments: ["herdr", "session", "attach"]))
+
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        XCTAssertEqual(Multiplexer.herdrSocket(session: nil), home + "/.config/herdr/herdr.sock")
+        XCTAssertEqual(Multiplexer.herdrSocket(session: "work"), home + "/.config/herdr/sessions/work/herdr.sock")
+        XCTAssertNil(Multiplexer.herdrSocket(session: ".."))
+        XCTAssertNil(Multiplexer.herdrSocket(session: "a/b"))
+    }
+
+    // MARK: Live probe
+
+    /// The live sources against throwaway servers that a driver script starts:
+    /// it passes them as JSON in `ISP_TERMINAL_WATCH_PROBE` (through xcodebuild's
+    /// `TEST_RUNNER_ISP_TERMINAL_WATCH_PROBE`). Skipped otherwise.
+    func testLiveProbe() throws {
+        guard let json = ProcessInfo.processInfo.environment["ISP_TERMINAL_WATCH_PROBE"] else {
+            throw XCTSkip("Needs ISP_TERMINAL_WATCH_PROBE: live tmux, zellij and herdr servers")
+        }
+        struct Config: Decodable {
+            let tmux: String
+            let tmuxClient: String
+            let zellij: String
+            let herdr: String
+            let herdrPanes: [[String]]
+            let herdrTabs: [[String]]
+        }
+        let config = try JSONDecoder().decode(Config.self, from: Data(json.utf8))
+        final class Counter { var refreshes = 0 }
+        let counter = Counter()
+        let watcher = TerminalWatcher(environment: .live(tmuxSocket: config.tmux), refresh: { counter.refreshes += 1 }, focusHerdr: { _ in })
+
+        let tmux = { (arguments: [String]) in Self.cli("/opt/homebrew/bin/tmux", ["-L", config.tmux] + arguments) }
+        let windowSize = { tmux(["display", "-p", "-t", "A", "#{window_width}x#{window_height}"]) }
+        let controlClient = { Self.cli("/usr/bin/pgrep", ["-f", "tmux -L \(config.tmux) -C attach"]) }
+        /// What a lookup of the frontmost pane would go through: tmux session A's active pane, herdr, zellij.
+        func lookup(tty: Bool = true) -> TerminalTrail {
+            var trail = TerminalTrail(tmux: true)
+            if tty, let pid = pid_t(tmux(["display", "-p", "-t", "A", "#{pane_pid}"])),
+               let foregroundPgid = TerminalTrail.foregroundPgid(ofPID: pid) {
+                trail.ttys = [TerminalTrail.TTY(pid: pid, foregroundPgid: foregroundPgid)]
+            }
+            trail.herdrSockets = Multiplexer.herdrSocket(session: config.herdr).map { [$0] } ?? []
+            trail.zellij = Multiplexer.zellijPane(session: config.zellij).map { TerminalTrail.Zellij(session: config.zellij, pane: $0) }
+            return trail
+        }
+        func spin(_ seconds: TimeInterval) { RunLoop.main.run(until: Date().addingTimeInterval(seconds)) }
+        func waitForRefresh(after count: Int, timeout: TimeInterval) -> TimeInterval? {
+            let start = Date()
+            while Date().timeIntervalSince(start) < timeout {
+                if counter.refreshes > count { return Date().timeIntervalSince(start) }
+                spin(0.002)
+            }
+            return nil
+        }
+        func step(_ name: String, expect: Bool = true, _ action: () -> Void) {
+            watcher.follow(lookup(), for: .ghostty) // as the lookup a refresh causes would
+            spin(0.3)
+            let count = counter.refreshes
+            action()
+            let latency = waitForRefresh(after: count, timeout: expect ? 3 : 1)
+            spin(0.3)
+            let result = latency.map { "refresh after \(Int($0 * 1000)) ms (\(counter.refreshes - count) in all)" } ?? "no refresh"
+            print("PROBE \(name): \(result)")
+            if expect { XCTAssertNotNil(latency, name) } else { XCTAssertNil(latency, name) }
+        }
+        func idleCPU(_ name: String, seconds: TimeInterval) {
+            var before = rusage(), childrenBefore = rusage(), after = rusage(), childrenAfter = rusage()
+            let client = controlClient()
+            let clientBefore = Self.cli("/bin/ps", ["-o", "time=", "-p", client])
+            getrusage(RUSAGE_SELF, &before)
+            getrusage(RUSAGE_CHILDREN, &childrenBefore)
+            let start = Date()
+            spin(seconds)
+            let wall = Date().timeIntervalSince(start)
+            getrusage(RUSAGE_SELF, &after)
+            getrusage(RUSAGE_CHILDREN, &childrenAfter)
+            func cpu(_ a: rusage, _ b: rusage) -> String {
+                func t(_ v: timeval) -> Double { Double(v.tv_sec) + Double(v.tv_usec) / 1e6 }
+                let used = t(b.ru_utime) + t(b.ru_stime) - t(a.ru_utime) - t(a.ru_stime)
+                return String(format: "%.2f%%", used / wall * 100)
+            }
+            let clientTime = client.isEmpty ? "none" : "\(clientBefore) -> \(Self.cli("/bin/ps", ["-o", "time=", "-p", client]))"
+            print("PROBE idle \(name) \(Int(wall))s: test host \(cpu(before, after)), reaped children (zellij CLI) \(cpu(childrenBefore, childrenAfter)), tmux control client cpu time \(clientTime)")
+        }
+
+        func cpuPerCall(_ name: String, _ body: () -> Void) {
+            func now() -> Double {
+                var usage = rusage()
+                getrusage(RUSAGE_SELF, &usage)
+                return Double(usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) + Double(usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) / 1e6
+            }
+            body()
+            let start = now()
+            for _ in 0 ..< 20 { body() }
+            print(String(format: "PROBE test host cpu per %@: %.2f ms", name, (now() - start) / 20 * 1000))
+        }
+        cpuPerCall("zellij client-list query") { _ = Multiplexer.zellijPane(session: config.zellij) }
+
+        let sizeBefore = windowSize()
+        var front: AnyCancellable? = watcher.watching(.ghostty).sink { _ in }
+        watcher.follow(lookup(), for: .ghostty)
+        let connected = waitForRefresh(after: 0, timeout: 5)
+        spin(1)
+        print("PROBE connect: first refresh after \(connected.map { "\(Int($0 * 1000)) ms" } ?? "none") (\(counter.refreshes) in all); control client pid \(controlClient())")
+        print("PROBE window size: \(sizeBefore) before, \(windowSize()) with the control client")
+        XCTAssertEqual(windowSize(), sizeBefore)
+
+        step("libproc: job starts in the tmux pane") { tmux(["send-keys", "-t", "A", "sleep 2", "Enter"]) }
+        step("libproc: job ends (the sleep 2 above)") {}
+        step("tmux: select-pane") { tmux(["select-pane", "-t", "A:0.0"]) }
+        step("tmux: select-window") { tmux(["select-window", "-t", "A:1"]) }
+        step("tmux: switch-client to another session") { tmux(["switch-client", "-c", config.tmuxClient, "-t", "B"]) }
+        step("tmux: switch-client back") { tmux(["switch-client", "-c", config.tmuxClient, "-t", "A"]) }
+        step("tmux: rename-window (ignored)", expect: false) { tmux(["rename-window", "-t", "A:0", "renamed"]) }
+        for (index, arguments) in config.herdrPanes.enumerated() {
+            step("herdr: pane focus #\(index + 1)") { Self.cli("/opt/homebrew/bin/herdr", arguments) }
+        }
+        for (index, arguments) in config.herdrTabs.enumerated() {
+            step("herdr: tab focus #\(index + 1)") { Self.cli("/opt/homebrew/bin/herdr", arguments) }
+        }
+        for direction in ["left", "right"] {
+            step("zellij: move-focus \(direction)") { Self.cli("/opt/homebrew/bin/zellij", ["-s", config.zellij, "action", "move-focus", direction]) }
+        }
+
+        var withoutZellij = lookup()
+        withoutZellij.zellij = nil
+        watcher.follow(withoutZellij, for: .ghostty)
+        spin(0.5)
+        idleCPU("frontmost, libproc + tmux + herdr watched", seconds: 10)
+        watcher.follow(lookup(), for: .ghostty)
+        spin(0.5)
+        idleCPU("frontmost, libproc + tmux + herdr + zellij watched", seconds: 10)
+
+        front = nil
+        step("left the front: select-window", expect: false) { tmux(["select-window", "-t", "A:0"]) }
+        idleCPU("after leaving the front (grace, then closed)", seconds: TerminalWatcher.connectionGrace + 1)
+        print("PROBE control client after the grace period: \(controlClient().isEmpty ? "gone" : "still running")")
+        XCTAssertTrue(controlClient().isEmpty)
+
+        let count = counter.refreshes
+        front = watcher.watching(.ghostty).sink { _ in }
+        let back = waitForRefresh(after: count, timeout: 5)
+        print("PROBE back to the front: refresh after \(back.map { "\(Int($0 * 1000)) ms" } ?? "none") (reattached, picked up the stored trail)")
+
+        watcher.follow(lookup(tty: false), for: .ghostty)
+        spin(0.5)
+        let beforeKill = counter.refreshes
+        tmux(["kill-server"])
+        spin(0.3)
+        tmux(["-f", "/dev/null", "new-session", "-d", "-s", "A", "-x", "120", "-y", "40"])
+        let reconnected = waitForRefresh(after: beforeKill, timeout: 10)
+        print("PROBE tmux kill-server, new server 0.3 s later: refresh after \(reconnected.map { "\(Int($0 * 1000)) ms" } ?? "none"), control client pid \(controlClient())")
+        XCTAssertNotNil(reconnected)
+        front = nil
+        _ = front
+    }
+
+    /// Runs `path` with the multiplexers' session variables removed, and returns its trimmed output.
+    @discardableResult
+    private static func cli(_ path: String, _ arguments: [String]) -> String {
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = arguments
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        process.environment = ProcessInfo.processInfo.environment.filter { key, _ in
+            !(key == "TMUX" || key == "TMUX_PANE" || key.hasPrefix("HERDR") || key.hasPrefix("ZELLIJ"))
+        }
+        guard (try? process.run()) != nil else { return "" }
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}

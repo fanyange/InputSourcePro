@@ -139,6 +139,7 @@ extension PreferencesVM {
     func migratePreferncesIfNeed() {
         update {
             $0.migrateCJKVFixStrategyIfNeed()
+            $0.migrateEnabledTerminalsIfNeed()
         }
 
         if preferences.prevInstalledBuildVersion <= 462 {
